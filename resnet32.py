@@ -163,7 +163,7 @@ class CifarResNet(nn.Module):
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
         if features == True:
-            return x /x.norm()
+            return x / x.norm()
         x = self.linear(x)
 
         return x

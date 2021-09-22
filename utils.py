@@ -1,4 +1,5 @@
 import random
+import statistics
 import plotly.graph_objects as go
 import numpy as np
 import seaborn as sns
@@ -11,9 +12,10 @@ from sklearn.svm import SVC
 from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from data import CustomCifar100
+from resnet32 import CifarResNet
+# from models import *
 
-
-def get_training_test_batches():
+def get_training_test_batches(mode):
     '''
     Handles the initialization of the dataset
 
@@ -33,9 +35,23 @@ def get_training_test_batches():
         train_batch_indexes = training_data.indexes_per_batch[i]
 
         test_batch_indexes = []
-        for j in range(i+1):
-            test_indexes = test_data.indexes_per_batch[j]
-            test_batch_indexes += test_indexes
+        if mode == "default":
+            for j in range(i+1):
+                test_indexes = test_data.indexes_per_batch[j]
+                test_batch_indexes += test_indexes
+        elif mode in ('cwwr', 'cwwnr'):
+            if i>=5:
+                break
+            for j in range(i+1):
+                test_indexes = test_data.indexes_per_batch[j]
+                test_batch_indexes += test_indexes
+        elif mode in ('ownr', 'owr'):
+            if i>=5:
+                break
+            else: 
+                for j in range(5, 5+i+1):
+                    test_indexes = test_data.indexes_per_batch[j]
+                    test_batch_indexes += test_indexes
 
         train_batch = Subset(training_data,train_batch_indexes)
         test_batch = Subset(test_data,test_batch_indexes)
@@ -45,7 +61,7 @@ def get_training_test_batches():
 
     return train_batches, test_batches
 
-def initialize_and_get_args(args: dict = None):
+def initialize_and_get_args(args: dict = None, model_type = "resnet32"):
     '''
     Calls set_seeds() and return default argument dict of static variables
 
@@ -61,24 +77,46 @@ def initialize_and_get_args(args: dict = None):
         args["device"] = "cuda" if torch.cuda.is_available() else "cpu"
         args["batch_size"] = 128
         args["memory"] = 2000
+        if model_type in ("resnet20", "resnet32", "resnet44", "resnet56", "resnet110"):
+            args["feature_size"] = 64
+        else:
+            print("Model {mode_str} not supported. Exiting...")
+            exit()
+            
 
     return args
 
 
-def set_seeds(seed: int = 1):
+def set_seeds(seed: int = 3):
     '''
     Sets the seeds for numpy, random, torch_manual and torch.cuda
 
     Arguments:
         seed: int
     '''
-    #cudnn.benchmark = False
-    #cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     random.seed(seed)
 
+
+def get_model(model_str: str):
+    if model_str == 'resnet32':
+        return CifarResNet()
+    elif model_str == 'resnet20':
+        return CifarResNet(depth=20)
+    elif model_str == 'resnet44':
+        return CifarResNet(depth=44)
+    elif model_str == 'resnet56':
+        return CifarResNet(depth=56)
+    elif model_str == 'resnet110':
+        return CifarResNet(depth=110)
+    else:
+        print("Model {mode_str} not supported. Exiting...")
+        exit()
 
 def confusionMatrix(labels, predictions, step):
     '''
@@ -122,50 +160,100 @@ def get_oneHot_labels(target, n_classes: int):
     return one_hot
 
 
-def FCClassifier(data, net, n_classes, device):
-    print('\n ### FC Layer ###')
-    print('   # FC Layer Predicting ')
-    net.eval()
+def fc_classifier(test_batch, model, n_classes, args, mode="default"):
+    model.eval()
 
-    running_corrects = 0
-    label_list, predictions = [], []
+    '''
+    mode:
+    - cwwr: closed world with rejection
+    - owr: open world with rejection
+
+    '''
+    correct, rejected = 0, 0
+    kept_labels, kept_predictions, all_labels = [], [], []
+    rej_thresh = 0.5
+    accepted, rejected, total = 0, 0, 0
+    unknown_label=-1
     with torch.no_grad():
-        loader = DataLoader(data, batch_size=512, shuffle=False, num_workers=2, drop_last=False)
+        loader = DataLoader(test_batch, batch_size=args["batch_size"], shuffle=False, num_workers=2, drop_last=False)
         for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
-
-            outputs = torch.sigmoid(net(images))
+            total+=len(labels)
+            images = images.to(args["device"])
+            labels = labels.to(args["device"])
+           
+            # Il problema era qui, mancava vincolo della dimensione
+            outputs = torch.softmax(model(images), dim=1, dtype = images.dtype)
             # Get predictions
-            _, preds = torch.max(outputs.data, 1)
+            probabilities, predictions = torch.max(outputs.data, 1)
             # Update Corrects
-            running_corrects += torch.sum(preds == labels.data).data.item()
-
-            for prediction, label in zip(preds, labels):
-                predictions.append(np.array(prediction.cpu()))
-                label_list.append(np.array(label.cpu()))
+           
+            for index, (probability, prediction, label) in enumerate(zip(probabilities, predictions, labels)):
+                if mode == 'default':
+                    kept_predictions.append(np.array(prediction.cpu()))
+                    kept_labels.append(np.array(label.cpu()))
+                #cwwr=closed world 
+                else:
+                    if probability > rej_thresh:
+                        accepted+=1
+                        if mode=='cwwr':
+                            if prediction==label:
+                              correct+=1
+                    else:
+                        rejected+=1
+                        if mode=='owr':
+                            correct+=1
 
     # Compute Accuracy
-    accuracy = running_corrects / len(data)
+    if mode == 'default':
+        accuracy=accuracy_score(kept_labels, kept_predictions)
+        print(f'   # FC Layer Accuracy: {accuracy:.2f}')
+    elif mode=='owr':
+        acc=accepted/total
+        rej=rejected/total
+        accuracy=correct/total
+        print(f'accepted: {accepted}')
+        print(f'rejected (and correct): {rejected}')
+        print(f'total: {total}')
+        print(f'Accuracy as correct/total: {accuracy}')
+    else: #cwwr
+        acc=accepted/total
+        rej=rejected/total
+        accuracy=correct/total
+        print(f'accepted: {accepted}')
+        print(f'correctly accepted: {correct}')
+        print(f'rejected: {rejected}')
+        print(f'total: {total}')
+        print(f'Accuracy as correct/total: {accuracy}')
 
-    print(f'   # FC Layer Accuracy: {accuracy}')
-    return accuracy, predictions, label_list
+    return accuracy, kept_predictions, kept_labels
 
-
-def get_max_distances_from_centroids(features, means):
+def get_max_distance_per_class(features, means):
     classes = list(means.keys())
-    max_dist_by_class = dict.fromkeys(classes, -1)
-
+    dist_by_class = dict((k, []) for k in classes)
+    max_dist_by_class = dict.fromkeys(classes, 0)
+    
     for label, features_by_class in features.items():
         for feature in features_by_class:
             for class_label, mean in means.items():
                 if class_label == label:
                     item_dist = torch.dist(mean, feature)
-                    if item_dist > max_dist_by_class[class_label]:
-                        max_dist_by_class[class_label] = item_dist
+                    dist_by_class[class_label].append(item_dist)
 
+              
+    percentile=25
+    for class_label in dist_by_class.keys():
+        p = int(len(dist_by_class[class_label]) * percentile / 100)
+        max_dist_by_class[class_label]=sorted(dist_by_class[class_label])[p]        
     return max_dist_by_class
 
+
+def get_min_distance_per_class(output, means, label):
+  
+    classes=list(means.keys())
+    for class_label, mean in means.items():
+        if class_label==label: #label is the one we gave
+            dist=torch.dist(output, mean)
+    return dist
 
 def nme_classifier(test_batch, train_batch, exemplars, model, n_classes, args, mode):
     '''
@@ -176,6 +264,11 @@ def nme_classifier(test_batch, train_batch, exemplars, model, n_classes, args, m
         test_batch: batch used for testing
         model: the resnet used
         args: dict containing the static variables
+
+    mode:
+    - deafult: iCaRL
+    - ownr: Open world with non naive rejection strategy based on distances
+    - cwwnr: Closed world with non naive rejection strategy based on distances
     '''
     model.eval()
 
@@ -183,7 +276,6 @@ def nme_classifier(test_batch, train_batch, exemplars, model, n_classes, args, m
     features: dict = dict((k, []) for k in range(n_classes))
     class_map: dict = dict((k, []) for k in range(n_classes-10, n_classes))
     rejected = dict.fromkeys(np.arange(n_classes), 0)
-    rej_thresh = 0.5
 
     # Set value part to empy list
     for item in train_batch:
@@ -193,7 +285,6 @@ def nme_classifier(test_batch, train_batch, exemplars, model, n_classes, args, m
                 class_map[key].append(item)
 
     # Compute means
-
     for key in range(n_classes):
         # If I am in the last ten classes use data
         if key in range(n_classes-10, n_classes):
@@ -205,7 +296,7 @@ def nme_classifier(test_batch, train_batch, exemplars, model, n_classes, args, m
         # loader with defined items
         loader = DataLoader(items, batch_size=args["batch_size"], shuffle=True, num_workers=2, drop_last=False)
 
-        feat_sum = torch.zeros((1, 64), device=args["device"])  # 64 for resnet structure
+        feat_sum = torch.zeros((1, args["feature_size"]), device=args["device"])  # 64 for resnet structure
         for images, labels in loader:
             with torch.no_grad():
                 images = images.to(args["device"])
@@ -222,17 +313,16 @@ def nme_classifier(test_batch, train_batch, exemplars, model, n_classes, args, m
         # feat_sum is 1x64 tensor obtained by summing all outputs
         mean = feat_sum/(2*len(items))  # I divide by 2*len because i concatenated images with its flipped version => dimension doubles
         # Add mean to means dictionary (and normalize, good practise to do so)
-        if mode == "ownr":
-            means[key] = mean
-        else:
-            means[key] = mean/mean.norm()
+        means[key]=mean/mean.norm()
 
     loader = DataLoader(test_batch, batch_size=args["batch_size"], shuffle=True, num_workers=2, drop_last=False)
     predictions, label_list = [], []
-    if mode == "ownr":
-        rej_thresh = get_max_distances_from_centroids(features, means)
-
+    if mode in ("ownr", "cwwnr"):
+        rej_thresh = get_max_distance_per_class(features, means)
+    
+    correct, accepted, total= 0, 0, 0
     for images, labels in loader:
+        total+=len(labels)
         images = images.to(args["device"])
         to_pop = list()
         with torch.no_grad():
@@ -251,22 +341,22 @@ def nme_classifier(test_batch, train_batch, exemplars, model, n_classes, args, m
                 # print(min_dist)
                 if mode == "default":
                     predictions.append(pred)
-                elif mode in ("cwwr", "owr"):
-                    if min_dist >= rej_thresh:
-                        
+                else:
+                    maximum=rej_thresh[pred] #calculate distance between centroid and its elements and select maximum
+                    dist_centroid_output=get_min_distance_per_class(output, means, pred) #calculate distance between centroid and pred
+                   
+                    if dist_centroid_output > maximum:
                         rejected[pred] += 1
                         to_pop.append(idx)
+                        if mode == "ownr":
+                            correct+=1
                     else:
-                        
+                        accepted+=1
                         predictions.append(pred)
-                elif mode == "ownr":
-                    if min_dist >= rej_thresh[pred]:
-                        rejected[pred] += 1
-                        to_pop.append(idx)
-                    else:
-                        predictions.append(pred)
+                        if mode == "cwwnr":
+                            correct += 1
 
-            if mode in ("cwwr", "owr"):
+            if mode in ("ownr", "cwwnr"): 
                 labels = list(labels)
                 for index in sorted(to_pop, reverse=True):  # needs to be reversed otherwiese deleting items changes the subsequent ones
                     del labels[index]
@@ -277,36 +367,33 @@ def nme_classifier(test_batch, train_batch, exemplars, model, n_classes, args, m
 
     if mode == "default":
         accuracy = accuracy_score(label_list, predictions)
-    elif mode == "cwwr":
-        accuracy = sum({value for (key, value) in rejected.items()})/len(test_batch)
-        #print(f'Accuracy of rejected samples with NME classifier in Closed World With Naive Rejection [closer to 0 is best]: {accuracy}')
-    elif mode == "owr":
-        accuracy = sum({value for (key, value) in rejected.items()})/len(test_batch)
-        #print(f'Accuracy of rejected samples with NME classifier in Open World With Naive Rejection [closer to 1 is best]: {accuracy}')
     elif mode == "ownr":
-        accuracy = sum({value for (key, value) in rejected.items()})/len(test_batch)
-        #print(f'Accuracy of rejected samples with NME classifier in Open World With Non-Naive Rejection [closer to 1 is best]: {accuracy}')
+        accuracy=correct/total
+        print(f'accepted: {accepted}')
+        print(f'rejected (and correct): {correct}')
+        print(f'total: {total}')
+        print(f'Accuracy as correct/total: {accuracy}')
+    elif mode == "cwwnr":
+        accuracy=correct/total
+        rejected=sum({value for (key, value) in rejected.items()})
+        print(f'accepted (and correct): {accepted}')
+        print(f'rejected: {rejected}')
+        print(f'total: {total}')
+        print(f'Accuracy as correct/total: {accuracy}')
 
     return accuracy, predictions, label_list
 
 
-def svm_classifier(exemplars, test, model, args):
-    '''
-    SVM classifier
+def svm_classifier(exemplars,test, model, args):
 
-    Parameters:
-        data: data used both for training and testing
-        model: the renset used
-        args: dict containing the static variables
-    '''
     model.eval()
     X_train, Y_train = [], []
-
+    
     new_exemplars=[]
     for key in exemplars:
         for item in exemplars[key]:
             new_exemplars.append([item[0], item[1]])
-
+  
     # Define train data
     loader = DataLoader(new_exemplars, batch_size=args["batch_size"], shuffle=False, num_workers=2, drop_last=False)
 
@@ -327,7 +414,7 @@ def svm_classifier(exemplars, test, model, args):
     score = 'accuracy'
     svm = SVC()
 
-    grid = {'C': [1], 'kernel': ['rbf']}  # Tried with 'C':[0.001, 0.01, 0.1, 1], C=1 is the best
+    grid = {'C': [0.1], 'kernel': ['rbf']}  # Tried with 'C':[0.001, 0.01, 0.1, 1], C=1 is the best
 
     best = best_version(x_train, y_train, x_val, y_val, svm, score, grid, -1)
     svm = SVC(**best.best_params_)
@@ -352,14 +439,7 @@ def svm_classifier(exemplars, test, model, args):
 
 
 def knn_classifier(exemplars, test, model, args):
-    '''
-    KNN classifier
-
-    Parameters:
-        data: data used both for training and testing
-        model: the renset used
-        args: dict containing the static variables
-    '''
+ 
     model.eval()
     X_train, Y_train = [], []
 
@@ -422,20 +502,27 @@ def best_version(x_train, y_train, x_val, y_val, regressor, score, grid, njobs):
     print(f"accuracy score: {accuracy_score(y_val,y_pred)}")
     return gs
 
-def accuracyPlot(accuracies, names, title):
+def CELoss(outputs,targets):
+    logsoftmax = torch.nn.LogSoftmax()
+    softmax = torch.nn.Softmax()
+    return torch.mean(torch.sum(- softmax(targets) * logsoftmax(outputs),1))
+
+def accuracyPlot(accuracies, std, names, mytitle):
 
     fig = go.Figure()
     for idx, el in enumerate(names):
         fig.add_trace(go.Scatter(
-           x=list(np.arange(10, 101, 10)),
+            ####101 10
+            x=list(np.arange(10, 51, 10)),
             y=accuracies[idx],
             error_y=dict(
                 type='data',
-                #array=std[idx]
+                array=std[idx]
             ),
             name=el
         ))
 
+    #####
     array = list(np.around(np.arange(0, 1.1, 0.1), decimals=1))
     for i in array:
         fig.add_shape(
@@ -443,7 +530,8 @@ def accuracyPlot(accuracies, names, title):
                 type="line",
                 x0=0,
                 y0=i,
-                x1=100,
+                #100
+                x1=50,
                 y1=i,
                 line=dict(
                     color="Grey",
@@ -451,9 +539,31 @@ def accuracyPlot(accuracies, names, title):
                     dash="dot",
                 )
             ))
+    ####
     fig['layout']['yaxis'].update(title='Accuracy', range=[0, 1], dtick=0.1, tickcolor='black', ticks="outside",
                                   tickwidth=1, ticklen=5)
-    fig['layout']['xaxis'].update(title='Number of classes', range=[0, 100.5], dtick=10, ticks="outside", tickwidth=0)
+    fig['layout']['xaxis'].update(title='Number of classes', range=[0, 50.5], dtick=10, ticks="outside", tickwidth=0)
     fig['layout'].update(height=700, width=900)
     fig['layout'].update(plot_bgcolor='rgb(256,256,256)')
+    if mytitle!='':
+        fig.update_layout(title=mytitle)
     fig.show()
+    return fig
+
+  
+def avg(seed1, seed2, seed3):
+    avg=[]
+    std=[]
+    for i in range(len(seed1)):
+        s=[seed1[i], seed2[i], seed3[i]]
+        avg.append(statistics.mean(s))
+        std.append(statistics.stdev(s))
+    return avg, std
+    
+def harmonicMean(closedW, closedStd, openW, openStd):
+    harmonic_mean=[]
+    std=[]
+    for i in range(len(closedW)):
+        harmonic_mean.append((2 * closedW[i] * openW[i]) / (closedW[i] + openW[i]))
+        std.append((closedStd[i] + openStd[i])/2)
+    return harmonic_mean, std

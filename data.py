@@ -11,7 +11,19 @@ class CustomCifar100(VisionDataset):
         super(CustomCifar100, self).__init__(root, transform=transform, target_transform=target_transform)
 
         self.dataset = CIFAR100(root=root, train=train, download=True, transform=None)
-        self.transform = transform
+
+        if train:
+            self.transform = transforms.Compose([ 
+
+                                transforms.ToTensor(),
+                                # transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
+                            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.ToTensor(),
+                # transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+        ])
+
         self.pixel_mean, self.pixel_std = self.get_mean_std(root)
 
         self.shuffled_classes = self.get_class_order()
@@ -34,20 +46,13 @@ class CustomCifar100(VisionDataset):
         Returns:
             list of integers (classes)
         """
-        '''class_order: list = [  # Taken from original iCaRL implementation:
+        class_order: list = [  # Taken from original iCaRL implementation:
             87, 0, 52, 58, 44, 91, 68, 97, 51, 15, 94, 92, 10, 72, 49, 78, 61, 14, 8, 86, 84, 96, 18,
             24, 32, 45, 88, 11, 4, 67, 69, 66, 77, 47, 79, 93, 29, 50, 57, 83, 17, 81, 41, 12, 37, 59,
             25, 20, 80, 73, 1, 28, 6, 46, 62, 82, 53, 9, 31, 75, 38, 63, 33, 74, 27, 22, 36, 3, 16, 21,
             60, 19, 70, 90, 89, 43, 5, 42, 65, 76, 40, 30, 23, 85, 2, 95, 56, 48, 71, 64, 98, 13, 99, 7,
             34, 55, 54, 26, 35, 39
-        ]'''
-        class_order=[33, 29, 7, 71, 48, 53, 58, 80, 11, 91, 18, 84, 78, 36, 60,
-                            1, 96, 90, 57, 54, 85, 17, 4, 92, 51, 99, 24, 95, 88, 89, 47,
-                            22, 46, 12, 59, 19, 72, 82, 10, 26, 87, 68, 34, 39, 8, 16, 77,
-                            21, 41, 97, 73, 38, 43, 63, 94, 9, 6, 2, 31, 14, 64, 15, 27, 23,
-                            37, 45, 49, 74, 65, 83, 40, 75, 62, 50, 61, 79, 69, 81, 25, 66,
-                            76, 3, 98, 30, 35, 5, 32, 52, 67, 20, 28, 0, 55, 13, 56, 42, 86,
-                            44, 93, 70]
+        ]
         return class_order
 
     @staticmethod
@@ -118,8 +123,7 @@ def augmentate(image):
     Returns:
         image: tensor with some augmentation performed
     """
-    image = F.pad(image, (4, 4, 4, 4), value=0)
-    x, y = np.random.randint(8), np.random.randint(8)  # pad=4 => max(x)=8
-    image = image[:, x:x+32, y:y+32]
-    image = torch.flip(image, [2])
-    return image
+
+    augmentations = transforms.Compose([transforms.RandomCrop((32, 32), padding=4), transforms.RandomHorizontalFlip(p=1)])
+
+    return augmentations(image)

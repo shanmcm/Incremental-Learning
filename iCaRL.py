@@ -5,10 +5,9 @@ import torch
 from torch.utils.data import DataLoader
 
 from data import augmentate
-from utils import FCClassifier, nme_classifier, svm_classifier, confusionMatrix, get_oneHot_labels, knn_classifier
+from utils import fc_classifier, nme_classifier, svm_classifier, confusionMatrix, get_oneHot_labels, knn_classifier, CELoss
+
 # Lwf (Learning without forgetting)
-
-
 def run_lwf(classif_loss, distill_loss, train_batches, test_batches, model, finetuning, args):
     '''
     Run method for Learning Without Forgetting
@@ -25,15 +24,13 @@ def run_lwf(classif_loss, distill_loss, train_batches, test_batches, model, fine
     for idx, batch in enumerate(train_batches):
         n_classes = (idx+1)*10
         model = update_representation(model, batch, {}, classif_loss, distill_loss, n_classes, args, finetuning)
-        accuracy, predictions, labels = FCClassifier(test_batches[idx], model, n_classes, args["device"])
+        accuracy, predictions, labels = fc_classifier(test_batches[idx], model, n_classes, args)
         accuracy_batch.append(accuracy)
         confusionMatrix(labels, predictions, idx)
 
     return accuracy_batch
 
 # Algorithm 2 (Incremental Train)
-
-
 def run(train_batches, test_batches, model, classifier, classif_loss, distill_loss, args, finetuning, mode):
     '''
     Run method of each version of iCarL depending on the input parameters
@@ -50,8 +47,18 @@ def run(train_batches, test_batches, model, classifier, classif_loss, distill_lo
     '''
     accuracy_batch = []
     exemplars = {}
+
     print(f"Running in mode: {mode}")
+    if mode == 'default':
+        print(f"Ideal model: 100% accuracy on each batch")
+    elif mode in ('cwwr', 'cwwnr'):
+        print(f"Ideal model: 100% accuracy, 0% rejected images")
+    elif mode in ('owr', 'ownr'):
+        print(f"Ideal model: 0% accuracy, 100% rejected images")
+
     for idx, batch in enumerate(train_batches):
+        if (mode!="default" and idx + 1 > 5):
+            break
         print(f'\n Batch #{idx+1}')
 
         # Define new number of classes (incremented of 10)
@@ -71,7 +78,7 @@ def run(train_batches, test_batches, model, classifier, classif_loss, distill_lo
         # Classification
         if mode == "default":
             if classifier == 'FC':
-                accuracy, predictions, labels = FCClassifier(test_batches[idx], model, n_class_incr, args["device"])
+                accuracy, predictions, labels = fc_classifier(test_batches[idx], model, n_class_incr, args)
             elif classifier == 'NME':
                 accuracy, predictions, labels = nme_classifier(test_batches[idx], batch, exemplars, model, n_class_incr, args, mode)
             elif classifier == 'SVM':
@@ -79,27 +86,34 @@ def run(train_batches, test_batches, model, classifier, classif_loss, distill_lo
             elif classifier == 'KNN':
                 accuracy, predictions, labels = knn_classifier(exemplars, test_batches[idx], model, args)
         else:
-            if idx + 1 >= 5:
-                break
             if mode == "cwwr":  # closed world with naive rejection
+                if classifier in ('NME', 'SVM', 'KNN'):
+                    raise NotImplementedError
+                elif classifier == 'FC':
+                    accuracy, predictions, labels = fc_classifier(test_batches[idx], model, n_class_incr, args, mode)
+            elif mode == 'cwwnr': # closed world with non-naive rejection
                 if classifier in ('FC', 'SVM', 'KNN'):
                     raise NotImplementedError
                 elif classifier == 'NME':
-                   
                     accuracy, predictions, labels = nme_classifier(test_batches[idx], batch, exemplars, model, n_class_incr, args, mode)
-            elif mode in ("owr", "ownr"):  # open world
+            elif mode == "owr":  # open world with naive rejection
+                if classifier in ('NME', 'SVM', 'KNN'):
+                    raise NotImplementedError
+                elif classifier == 'FC':
+                    accuracy, predictions, labels = fc_classifier(test_batches[idx], model, n_class_incr, args, mode)
+            elif mode == 'ownr':  # open world with non-naive rejection
                 if classifier in ('FC', 'SVM', 'KNN'):
                     raise NotImplementedError
                 elif classifier == 'NME':
-                    accuracy, predictions, labels = nme_classifier(test_batches[idx+5], batch, exemplars, model, n_class_incr, args, mode)
+                    accuracy, predictions, labels = nme_classifier(test_batches[idx], batch, exemplars, model, n_class_incr, args, mode)
 
 
         # Add accuracy of batch
         accuracy_batch.append(accuracy)
-        print(f'\n Accuracy NME Batch #{idx+1}: {accuracy}')
+        print(f'\n Accuracy Batch #{idx+1}: {accuracy}')
 
         # Plot confusion matrix --> è già in utils
-        if mode == "default" or mode == "cwwr":
+        if mode == "default":
             confusionMatrix(labels, predictions, idx)
 
         exemplars = reduce_exemplars_set(exemplars, n_class_incr, args["memory"])
@@ -107,8 +121,6 @@ def run(train_batches, test_batches, model, classifier, classif_loss, distill_lo
     return accuracy_batch
 
 # Algorithm 3 (Update Representation)
-
-
 def update_representation(model, data, exemplars, classif_loss, distill_loss, n_classes, args, finetuning):
     '''
     Algorithm 3 in iCarL's paper
@@ -166,28 +178,42 @@ def update_representation(model, data, exemplars, classif_loss, distill_loss, n_
             optimizer.zero_grad()
             # Forward pass to the network
             # Get One Hot Encoding for the labels
-            if 'BCE' in str(classif_loss):
-                outputs = model(images)
-            if 'MSE' in str(classif_loss):
-                outputs = torch.sigmoid(model(images))
+
+            outputs = model(images)
+            outputs_sigmoid = torch.sigmoid(model(images))
 
             labels = get_oneHot_labels(labels, n_classes)
             labels = labels.to(args["device"])
 
             # Compute Losses
             if n_classes == 10 or finetuning:
-                tot_loss = classif_loss(outputs, labels)
+                if 'BCE' in str(classif_loss):
+                    tot_loss = classif_loss(outputs, labels)
+                else:
+                    tot_loss = classif_loss(outputs_sigmoid, labels)
+
             else:
                 with torch.no_grad():
                     old_outputs = torch.sigmoid(old_model(images))
+
+                # BCE + BCE
                 if 'BCE' in str(distill_loss):
                     targets = torch.cat((old_outputs, labels[:, n_classes-10:]), 1)
-                    tot_loss = distill_loss(outputs, targets)
+                    tot_loss = classif_loss(outputs, targets)
+                # MSE + MSE
                 elif 'MSE' in str(distill_loss):
+                    targets = torch.cat((old_outputs, labels[:, n_classes-10:]), 1)
+                    tot_loss = classif_loss(outputs_sigmoid, targets) #classification and distillation loss are equal, so indifferent which one I use
+                # BCE + L1
+                elif 'L1' in str(distill_loss):
                     class_loss = classif_loss(outputs, labels)
-                    dist_loss = torch.pow(classif_loss(torch.pow(outputs[:,:n_classes-10],2),torch.pow(old_outputs,2)), 1/2)
-                    tot_loss = dist_loss*.2 + class_loss
-            
+                    dist_loss = distill_loss(outputs_sigmoid[:,:n_classes-10],old_outputs)/(args["batch_size"]*(n_classes-10)) #last terms is normalising one, otherwise loss explodes (nan)
+                    tot_loss = dist_loss + class_loss
+                # BCE + CE
+                else:
+                    class_loss = classif_loss(outputs,labels)
+                    dist_loss = CELoss(outputs_sigmoid[:,:n_classes-10],old_outputs)
+                    tot_loss=dist_loss + class_loss
 
             # Update Running Loss
             running_loss += tot_loss.item() * images.size(0)
@@ -202,8 +228,6 @@ def update_representation(model, data, exemplars, classif_loss, distill_loss, n_
     return model
 
 # Algorithm 4 (Construct Exemplars)
-
-
 def construct_exemplars_set(model, data, n_classes, args):
     '''
     Algorithm 4 in iCarL's paper
@@ -231,7 +255,7 @@ def construct_exemplars_set(model, data, n_classes, args):
     print("Images/label map created. Creating dictionary with features of each class...")
     model.eval()  # We don't want train just evaulate the classes
     outputs_class = {el: [] for el in classes}
-    means: dict = {el: torch.zeros((1, 64), device=args["device"]) for el in classes}
+    means: dict = {el: torch.zeros((1, args["feature_size"]), device=args["device"]) for el in classes}
     exemplars: dict = {el: [] for el in classes}
     for key in modified_data:
         with torch.no_grad():
@@ -279,8 +303,6 @@ def construct_exemplars_set(model, data, n_classes, args):
     return exemplars
 
 # Algorithm 5 (Reduce exemplar set)
-
-
 def reduce_exemplars_set(exemplars, classes_n, memory):
     '''
     Algorithm 5 in iCarL's paper, reduces the size of the exemplars' set
