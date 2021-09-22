@@ -10,7 +10,8 @@ This project focuses on reproducing results from the  **[iCaRL](https://arxiv.or
 * iCaRL.py: algorithms for iCaRL;
 * notebook.ipynb: main file, run it with the rest of the files in the same folder;
 * resnet32.py: contains the models: resnet32 and variations;
-* utils.py: helping functions and algorithms used for variations of iCaRL.
+* utils.py: helping functions and algorithms used for variations of iCaRL;
+* report.pdf: detailed explanation of the project.
 
 ## Contributors
 Bruno Franco Gabriele <br/>
